@@ -1,0 +1,199 @@
+from typing import Optional
+from openai import OpenAI
+import streamlit as st
+import pandas as pd
+import json
+from dotenv import load_dotenv
+import io
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
+###################### FUNCTIONS ######################
+
+# SUMMARIZES THE DATASET TO FEED INTO THE PROMPT
+def summarize_dataset(dataframe: pd.DataFrame)->str:
+
+    """ 
+    Generate a comprehensive summary of the dataset for LLM context.
+
+    This function creates a detailed text summary that includes:
+        - Column datatypes and schema information
+        - Missing value counts and data completeness
+        - Cardinality (unique value counts) for each categorical columns
+        - Statistical summary for numerical columns
+        - Sample data rows in csv format
+
+    Args:
+        dataframe (pd.DataFrame): The input dataframe to summarize
+
+    Returns:
+        str: A detailed summary of the dataset
+    """
+
+    try:
+        # Create a string buffer to capture CSV output in memory
+        buffer = io.StringIO()
+
+        # Limit sample to first 30 rows to avoid overwhelming the LLM with too much data
+        sample_rows = min(30, len(dataframe))
+
+        # Convert sample rows to CSV format and write to buffer
+        dataframe.head(sample_rows).to_csv(buffer, index=False)
+        sample_csv = buffer.getvalue()
+
+        # Extract datatype information for each column
+        dtypes = dataframe.dtypes.astype(str).to_dict()
+
+        # Count non-null values for each column (data completeness)
+        non_null_counts = dataframe.notnull().sum().to_dict()
+
+        # Count null/missing values for each column
+        null_counts = dataframe.isnull().sum().to_dict()
+
+        # Calculate unique value counts per column (cardinality
+        # dropna = True excludes NaN values from the count
+        nunique = dataframe.nunique(dropna=True).to_dict()
+
+        # Identify numeric columns for statistical analysis
+        numeric_cols = [c for c in dataframe.columns if pd.api.types.is_numeric_dtype(dataframe[c])]
+
+        # Generate descriptive statistics for numeric columns only
+        # Returns empty dicts if no numeric columns are found
+        desc = dataframe[numeric_cols].describe().to_dict() if numeric_cols else {}
+
+        # Build the summary report line by line
+        lines = []
+
+        # Section 1: Schema information (data types)
+        lines.append("Schema (dtype):")
+        for k,v in dtypes.items():
+            lines.append(f"- {k}: {v}")
+        lines.append("") # Add an empty line after schema section
+        
+        # Section 2: Data completeness
+        lines.append("Null/Non-Null Counts:")
+        for c in dataframe.columns:
+            lines.append(f"- {c}: non_nulls = {int(non_null_counts[c])}, \
+                nulls = {int(null_counts[c])}")
+        lines.append("") # Add an empty line after data completeness section
+        
+        # Section 3: Cardinality (unique value counts)
+        lines.append("Cardinality (nunique):")
+        for k,v in nunique.items():
+            lines.append(f"- {k}: {int(v)}")
+        lines.append("") # Add an empty line after cardinality section
+        
+        # Section 4: Statistical summary for numeric columns
+        if desc:
+            lines.append("Numeric summary stats (describe):")
+            for col, stats in desc.items():
+                # Format each statistic with proper rounding and handle NaN values
+                stat_line = ", ".join([f"{s}:{round(float(val), 4) if pd.notnull(val) else 'nan'}"
+                                    for s, val in stats.items()])
+                lines.append(f"- {col}: {stat_line}")
+        lines.append("") # Add an empty line after statistical summary section
+        
+        # Section 5: Sample data rows in csv format
+        lines.append("Sample rows (CSV head):")
+        lines.append(sample_csv)
+        
+        # Join all lines into a single string with line breaks
+        summary = "\n".join(lines)
+        return summary
+    
+    except Exception as e:
+        st.error(f"Error generating dataset summary: {str(e)}")
+        return "Error generating dataset summary"
+
+
+# FUNCTION TO BUILD THE PROMPT FOR THE DATA CLEANING
+# THIS PROMPT IS USED TO CLEAN THE DATAFRAME
+# IT IS USED TO REMOVE ANY ROWS WITH MISSING VALUES
+# AND TO ENSURE THAT THE DATA IS IN A FORMAT THAT IS SUITABLE FOR RUNNING MACHINE LEARNING MODELS
+def build_cleaning_prompt(df):
+    data_summary = summarize_dataset(df)
+
+    prompt = f""" 
+
+    You are an expert data scientist, specifically in the field
+    of data cleaning and preprocessing. You are a given a dataframe summary and you are tasked with cleaning the dataset:
+
+    {data_summary}
+
+    Make sure to handle the:
+    - Missing values
+    - Duplicates
+    - Outliers
+
+    Write a python script to clean the dataset, based on the data summary provided, and return a json property called "script."
+
+
+
+    """
+    return prompt
+
+# SYSTEM PROMPT FOR THE LLM
+SYSTEM_PROMPT = "You are a senior data engineer. Always return a strict JSON object matching the user's requested schema."
+
+# USES THE PROMPT CREATED TO FEED INTO THE LLM
+def get_llm_response(prompt:str) -> Optional[str]:
+    try:
+        client = OpenAI(
+            base_url=
+            api_key=os.getenv("OPENAI_API_KEY")
+            )
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"}
+            messages=[
+                {"role": "system", "content": (
+                    SYSTEM_PROMPT
+                )},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        if not response or not getattr(response, "choices", None):
+            return None
+        text = response.choices[0].message.content or ""
+
+        # EXPECT A JSON OBJECT WITH A SCRIPT PROPERTY
+        try:
+            json_obj = json.loads(text)
+            script_val = json_obj.get("script")
+            if isinstance(script_val, str) and script_val.strip():
+                return script_val.strip()
+        except json.JSONDecodeError:
+            st.error(f"Invalid JSON response: {text}")
+            return None
+    except Exception as e:
+        st.error(f"Error getting LLM response: {str(e)}")
+        return None
+
+
+
+###################### USER INTERFACE ######################
+# USES STREAMLIT TO BUILD THE UI AND ADD A TITLE
+st.title("Autonomous ML Agent")
+# DESCRIPTION TEXT TO GUIDE THE USER ON HOW TO START 
+st.markdown("Upload a CSV file to get started")
+
+# USES STREAMLIT TO ALLOW USER TO UPLOAD A CSV FILE 
+uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+
+# ONCE USER HAS UPLOADED A CSV FILE, IT IS READ INTO A PANDAS DATAFRAME
+# THE DATAFRAME IS DISPLAYED TO THE USER ON THE APP
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.write(df)
+
+    selected_column = st.selectbox("Select a column to predict", 
+    df.columns.tolist(), 
+    help = "The column to predict")
+
+button  = st.button("Run Autonomous ML Agent")
+
+if button:
+    cleaning_prompt = build_cleaning_prompt(df)
+    st.write(cleaning_prompt)
