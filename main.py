@@ -10,7 +10,7 @@ import os
 # Load environment variables from .env file
 load_dotenv()
 
-###################### FUNCTIONS ######################
+###################### FUNCTIONS #########################################################################################
 
 # SUMMARIZES THE DATASET TO FEED INTO THE PROMPT
 def summarize_dataset(dataframe: pd.DataFrame)->str:
@@ -126,10 +126,10 @@ def build_cleaning_prompt(df):
     - Missing values
     - Duplicates
     - Outliers
+    - Standardize the data accordingly
+    - Use one-hot encoding for categorical columns
 
     Write a python script to clean the dataset, based on the data summary provided, and return a json property called "script."
-
-
 
     """
     return prompt
@@ -141,12 +141,12 @@ SYSTEM_PROMPT = "You are a senior data engineer. Always return a strict JSON obj
 def get_llm_response(prompt:str) -> Optional[str]:
     try:
         client = OpenAI(
-            base_url=
-            api_key=os.getenv("OPENAI_API_KEY")
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY")
             )
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"}
+            model="openai/gpt-oss-120b:free",
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": (
                     SYSTEM_PROMPT
@@ -160,20 +160,35 @@ def get_llm_response(prompt:str) -> Optional[str]:
 
         # EXPECT A JSON OBJECT WITH A SCRIPT PROPERTY
         try:
-            json_obj = json.loads(text)
+            # Handle OpenRouter's response format with special tokens
+            if "<|message|>" in text:
+                # Extract JSON content between <|message|> and the end
+                json_start = text.find("<|message|>") + len("<|message|>")
+                json_content = text[json_start:].strip()
+            else:
+                # If no special tokens, use the entire response
+                json_content = text
+            
+            json_obj = json.loads(json_content)
+            # GET THE SCRIPT VALUE FROM THE JSON OBJECT
             script_val = json_obj.get("script")
+            # IF THE SCRIPT VALUE IS A STRING, AND IT IS NOT EMPTY, RETURN THE SCRIPT VALUE
             if isinstance(script_val, str) and script_val.strip():
+                # USED TO REMOVE ANY EXTRA WHITESPACE OR NEWLINES
                 return script_val.strip()
         except json.JSONDecodeError:
             st.error(f"Invalid JSON response: {text}")
             return None
+
+        # IF NO SCRIPT FOUND, RETURN NONE
+        return None
+
     except Exception as e:
         st.error(f"Error getting LLM response: {str(e)}")
         return None
 
 
-
-###################### USER INTERFACE ######################
+###################### USER INTERFACE ##########################################################################################
 # USES STREAMLIT TO BUILD THE UI AND ADD A TITLE
 st.title("Autonomous ML Agent")
 # DESCRIPTION TEXT TO GUIDE THE USER ON HOW TO START 
@@ -195,5 +210,13 @@ if uploaded_file is not None:
 button  = st.button("Run Autonomous ML Agent")
 
 if button:
-    cleaning_prompt = build_cleaning_prompt(df)
-    st.write(cleaning_prompt)
+    with st.spinner("Running Autonomous ML Agent..."):
+        # BUILD THE CLEANING PROMPT
+        cleaning_prompt = build_cleaning_prompt(df)
+        # DISPLAY THE CLEANING PROMPT IN AN ACCORDION
+        with st.expander("Cleaning Prompt"):
+            st.write(cleaning_prompt)
+        script = get_llm_response(cleaning_prompt)
+        # DISPLAY THE SCRIPT IN AN ACCORDION
+        with st.expander("Script"):
+            st.code(script)
