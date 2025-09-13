@@ -6,6 +6,7 @@ import json
 from dotenv import load_dotenv
 import io
 import os
+from e2b_code_interpreter import Sandbox
 
 # Load environment variables from .env file
 load_dotenv()
@@ -130,7 +131,12 @@ def build_cleaning_prompt(df):
     - Use one-hot encoding for categorical columns
 
     Write a python script to clean the dataset, based on the data summary provided, and return a json property called "script."
-
+    
+    ## IMPORTANT ##
+    - Make sure to load the data from the csv file called "/tmp/input.csv".
+    - The script should be a python script that can be executed to clean the data.
+    - Make sure to save the cleaned data to a new csv file called "/tmp/cleaned.csv".
+    - The script should handle any errors gracefully and print status messages.
     """
     return prompt
 
@@ -145,7 +151,7 @@ def get_llm_response(prompt:str) -> Optional[str]:
             api_key=os.getenv("OPENROUTER_API_KEY")
             )
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b:free",
+            model="deepseek/deepseek-chat-v3.1:free",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": (
@@ -187,6 +193,69 @@ def get_llm_response(prompt:str) -> Optional[str]:
         st.error(f"Error getting LLM response: {str(e)}")
         return None
 
+def execute_in_e2b(script: str, csv_bytes: bytes):
+    """
+    Execute a Python script in an E2B sandbox with the provided CSV data.
+    
+    Args:
+        script (str): The Python script to execute
+        csv_bytes (bytes): The CSV file data as bytes
+        
+    Returns:
+        tuple: (cleaned_csv_bytes, exec_info) or (None, exec_info) on error
+    """
+    api_key = os.getenv("E2B_API_KEY")
+    if not api_key:
+        st.error("E2B_API_KEY is not set")
+        return None, {}
+    
+    # Create a dictionary to store execution results
+    exec_info = {}
+    
+    try:
+        # DOCUMENTATION: https://docs.e2b.dev/getting-started/introduction
+        # Create E2B sandbox instance - E2B manages lifecycle automatically
+        sandbox = Sandbox.create(api_key=api_key)
+        
+        # Upload the CSV file to the sandbox
+        sandbox.files.write("/tmp/input.csv", csv_bytes)
+        
+        # Execute the script directly using run_code
+        result = sandbox.run_code(script)
+        
+        # Store execution results
+        exec_info["exit_code"] = getattr(result, "exit_code", 0)
+        exec_info["stdout"] = getattr(result, "stdout", "")
+        exec_info["stderr"] = getattr(result, "stderr", "")
+        
+        # Debug: Check what files exist in /tmp
+        try:
+            list_result = sandbox.run_code("import os; print('Files in /tmp:'); print(os.listdir('/tmp'))")
+            exec_info["debug_files"] = getattr(list_result, "stdout", "")
+            print("Debug - Files in /tmp:", exec_info["debug_files"])
+        except Exception as e:
+            exec_info["debug_files"] = f"Error listing files: {str(e)}"
+        
+        # Try to download the cleaned CSV file
+        try:
+            # The script should save the cleaned data to "/tmp/cleaned.csv"
+            cleaned_bytes = sandbox.files.read("/tmp/cleaned.csv")
+            return cleaned_bytes, exec_info
+        except Exception as e:
+            st.error(f"Error downloading cleaned file: {str(e)}")
+            st.error(f"Debug info: {exec_info.get('debug_files', 'No debug info')}")
+            return None, exec_info
+                
+    except Exception as e:
+        st.error(f"Error executing script in E2B: {str(e)}")
+        return None, exec_info
+    
+    finally:
+        # Only kill after we've retrieved all results
+        try:
+            sandbox.kill()
+        except:
+            pass  # Ignore errors if sandbox is already dead
 
 ###################### USER INTERFACE ##########################################################################################
 # USES STREAMLIT TO BUILD THE UI AND ADD A TITLE
@@ -220,3 +289,20 @@ if button:
         # DISPLAY THE SCRIPT IN AN ACCORDION
         with st.expander("Script"):
             st.code(script)
+        
+        with st.spinner("Executing script in E2B sandbox..."):
+            input_csv_bytes = df.to_csv(index=False).encode('utf-8')
+            cleaned_bytes, exec_info = execute_in_e2b(script, input_csv_bytes)
+
+            with st.expander("E2B Execution Info"):
+                st.write(exec_info)
+            
+            with st.expander("Cleaned Data"):
+                # Handle both string and bytes from E2B files.read()
+                if isinstance(cleaned_bytes, str):
+                    # If it's a string, use StringIO
+                    cleaned_df = pd.read_csv(io.StringIO(cleaned_bytes))
+                else:
+                    # If it's bytes, use BytesIO
+                    cleaned_df = pd.read_csv(io.BytesIO(cleaned_bytes))
+                st.write(cleaned_df)

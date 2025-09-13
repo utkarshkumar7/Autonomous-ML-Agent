@@ -17,6 +17,9 @@ daytona_api_client==0.27.1
 daytona_api_client_async==0.27.1
 Deprecated==1.2.18
 distro==1.9.0
+dockerfile-parse==2.0.1
+e2b==2.1.2
+e2b-code-interpreter==2.0.0
 environs==14.3.0
 frozenlist==1.7.0
 gitdb==4.0.12
