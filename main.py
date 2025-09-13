@@ -140,6 +140,53 @@ def build_cleaning_prompt(df):
     """
     return prompt
 
+# FUNCTION TO BUILD THE PROMPT FOR MODEL TRAINING
+def build_model_training_prompt(df, target_column):
+    """
+    Build a prompt for training multiple ML models on the cleaned dataset.
+    
+    Args:
+        df (pd.DataFrame): The cleaned dataframe
+        target_column (str): The target column to predict
+        
+    Returns:
+        str: The prompt for model training
+    """
+    data_summary = summarize_dataset(df)
+    
+    prompt = f"""
+    You are an expert machine learning engineer. You are given a cleaned dataset and need to train multiple models to predict the target column.
+    
+    Dataset Summary:
+    {data_summary}
+    
+    Target Column: {target_column}
+    
+    Your task is to:
+    1. Load the cleaned dataset from "/tmp/cleaned.csv"
+    2. Prepare the data for machine learning (feature engineering, train/test split)
+    3. Train  the following models:
+       - Logistic Regression (for classification) or Linear Regression (for regression)
+       - Random Forest
+       - XGBoost or Gradient Boosting
+       - One additional model of your choice
+    4. Evaluate each model using appropriate metrics
+    5. Compare model performance
+    6. Save the best model and results
+    
+    Important Requirements:
+    - Use scikit-learn, pandas, numpy, and other standard ML libraries
+    - Implement proper train/test split (80/20 or 70/30)
+    - Use cross-validation for robust evaluation
+    - Handle both classification and regression tasks automatically
+    - Save model results to "/tmp/model_results.csv"
+    - Save the best model using joblib to "/tmp/best_model.pkl"
+    - Print detailed performance metrics for each model
+    
+    Return a JSON object with a "script" property containing the complete Python code.
+    """
+    return prompt
+
 # SYSTEM PROMPT FOR THE LLM
 SYSTEM_PROMPT = "You are a senior data engineer. Always return a strict JSON object matching the user's requested schema."
 
@@ -257,11 +304,88 @@ def execute_in_e2b(script: str, csv_bytes: bytes):
         except:
             pass  # Ignore errors if sandbox is already dead
 
+def execute_model_training_in_e2b(script: str, cleaned_csv_bytes: bytes):
+    """
+    Execute a model training script in an E2B sandbox with the cleaned CSV data.
+    
+    Args:
+        script (str): The Python script to execute for model training
+        cleaned_csv_bytes (bytes): The cleaned CSV file data as bytes
+        
+    Returns:
+        tuple: (model_results_bytes, best_model_bytes, exec_info) or (None, None, exec_info) on error
+    """
+    api_key = os.getenv("E2B_API_KEY")
+    if not api_key:
+        st.error("E2B_API_KEY is not set")
+        return None, None, {}
+    
+    # Create a dictionary to store execution results
+    exec_info = {}
+    
+    try:
+        # Create E2B sandbox instance with timeout
+        sandbox = Sandbox.create(api_key=api_key, timeout=120)  # 2 minutes for model training
+        
+        # Upload the cleaned CSV file to the sandbox
+        sandbox.files.write("/tmp/cleaned.csv", cleaned_csv_bytes)
+        
+        # Execute the model training script
+        result = sandbox.run_code(script)
+        
+        # Store execution results
+        exec_info["exit_code"] = getattr(result, "exit_code", 0)
+        exec_info["stdout"] = getattr(result, "stdout", "")
+        exec_info["stderr"] = getattr(result, "stderr", "")
+        
+        # Debug: Check what files exist in /tmp
+        try:
+            list_result = sandbox.run_code("import os; print('Files in /tmp:'); print(os.listdir('/tmp'))")
+            exec_info["debug_files"] = getattr(list_result, "stdout", "")
+        except Exception as e:
+            exec_info["debug_files"] = f"Error listing files: {str(e)}"
+        
+        # Try to download the model results and best model
+        model_results_bytes = None
+        best_model_bytes = None
+        
+        try:
+            # Download model results CSV
+            model_results_bytes = sandbox.files.read("/tmp/model_results.csv")
+        except Exception as e:
+            st.warning(f"Could not download model results: {str(e)}")
+        
+        try:
+            # Download best model pickle file
+            best_model_bytes = sandbox.files.read("/tmp/best_model.pkl")
+        except Exception as e:
+            st.warning(f"Could not download best model: {str(e)}")
+        
+        return model_results_bytes, best_model_bytes, exec_info
+                
+    except Exception as e:
+        st.error(f"Error executing model training in E2B: {str(e)}")
+        return None, None, exec_info
+    finally:
+        # Clean up sandbox
+        try:
+            sandbox.kill()
+        except:
+            pass
+
 ###################### USER INTERFACE ##########################################################################################
 # USES STREAMLIT TO BUILD THE UI AND ADD A TITLE
 st.title("Autonomous ML Agent")
 # DESCRIPTION TEXT TO GUIDE THE USER ON HOW TO START 
-st.markdown("Upload a CSV file to get started")
+st.markdown("""
+Welcome to the Autonomous ML Agent!
+
+This autonomous machine learning agent ingests tabular datasets, automatically cleans and preprocesses the data, 
+trains models, and optimizes them for target metrics such as accuracy, precision, or recall.
+
+The entire pipeline is orchestrated by LLMs, where they generate and modify code, select appropriate algorithms, 
+and iteratively refine the pipeline until the best-performing model is achieved.
+""")
 
 # USES STREAMLIT TO ALLOW USER TO UPLOAD A CSV FILE 
 uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
@@ -276,9 +400,12 @@ if uploaded_file is not None:
     df.columns.tolist(), 
     help = "The column to predict")
 
+# Button to run the Autonomous ML Agent
 button  = st.button("Run Autonomous ML Agent")
 
+# ONCE THE BUTTON IS CLICKED, THE AUTONOMOUS ML AGENT STARTS RUNNING
 if button:
+    # SPINNER TO SHOW THAT THE AUTONOMOUS ML AGENT IS RUNNING
     with st.spinner("Running Autonomous ML Agent..."):
         # BUILD THE CLEANING PROMPT
         cleaning_prompt = build_cleaning_prompt(df)
@@ -289,14 +416,15 @@ if button:
         # DISPLAY THE SCRIPT IN AN ACCORDION
         with st.expander("Script"):
             st.code(script)
-        
-        with st.spinner("Executing script in E2B sandbox..."):
+        # SPINNER TO SHOW THAT THE SCRIPT IS BEING EXECUTED IN THE E2B SANDBOX
+        with st.spinner("Executing cleaning script in E2B sandbox..."):
+            # CONVERT THE DATAFRAME TO A CSV FILE AND ENCODE IT TO BYTES
             input_csv_bytes = df.to_csv(index=False).encode('utf-8')
             cleaned_bytes, exec_info = execute_in_e2b(script, input_csv_bytes)
-
+            # DISPLAY THE EXECUTION INFO IN AN ACCORDION
             with st.expander("E2B Execution Info"):
                 st.write(exec_info)
-            
+            # DISPLAY THE CLEANED DATA IN AN ACCORDION
             with st.expander("Cleaned Data"):
                 # Handle both string and bytes from E2B files.read()
                 if isinstance(cleaned_bytes, str):
@@ -305,4 +433,54 @@ if button:
                 else:
                     # If it's bytes, use BytesIO
                     cleaned_df = pd.read_csv(io.BytesIO(cleaned_bytes))
+                # DISPLAY THE CLEANED DATAFRAME
                 st.write(cleaned_df)
+                
+                # STEP 2: MODEL TRAINING
+                st.markdown("---")
+                st.markdown("Model Training")
+                
+                if cleaned_bytes is not None:
+                    # Build the model training prompt
+                    model_training_prompt = build_model_training_prompt(cleaned_df, selected_column)
+                    
+                    # Display the model training prompt
+                    with st.expander("Model Training Prompt"):
+                        st.write(model_training_prompt)
+                    
+                    # Get the model training script from LLM
+                    model_script = get_llm_response(model_training_prompt)
+                    
+                    # Display the model training script
+                    with st.expander("Model Training Script"):
+                        st.code(model_script)
+                    
+                    # Execute model training in E2B sandbox
+                    with st.spinner("Training models in E2B sandbox..."):
+                        model_results_bytes, best_model_bytes, model_exec_info = execute_model_training_in_e2b(
+                            model_script, cleaned_bytes
+                        )
+                        
+                        # Display model training execution info
+                        with st.expander("Model Training Execution Info"):
+                            st.write(model_exec_info)
+                        
+                        # Display model results if available
+                        if model_results_bytes is not None:
+                            with st.expander("Model Results"):
+                                # Handle both string and bytes from E2B files.read()
+                                if isinstance(model_results_bytes, str):
+                                    model_results_df = pd.read_csv(io.StringIO(model_results_bytes))
+                                else:
+                                    model_results_df = pd.read_csv(io.BytesIO(model_results_bytes))
+                                st.write(model_results_df)
+                        
+                        # Display best model info if available
+                        if best_model_bytes is not None:
+                            with st.expander("Best Model"):
+                                st.success("Best model has been trained and saved!")
+                                st.info("Model file is available for download (best_model.pkl)")
+                        else:
+                            st.warning("Best model file was not created. Check the execution info for details.")
+                else:
+                    st.error("Cannot proceed with model training - no cleaned data available.")
